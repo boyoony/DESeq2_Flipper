@@ -1,0 +1,418 @@
+################################################################################
+# Differential CLIP-seq Binding Analysis: WT vs M182A
+# Adapted from the Flipper framework (Flanagan et al., 2026)
+#
+# Dependencies: BEDTools, samtools, R (DESeq2, tidyverse)
+#
+# Input files:
+#   - annotation.gtf: C. elegans genome annotation (GTF format)
+#
+#   - peaks_with_IDs_stranded.bed: 356 WT bound regions (BED6 format)
+#       Column 1: Chromosome (e.g. I, II, III, IV, V, X)
+#       Column 2: Peak start (0-based)
+#       Column 3: Peak end
+#       Column 4: WBGene ID of parent gene (e.g. WBGene00000001)
+#       Column 5: Score (placeholder ".")
+#       Column 6: Strand (+ or -)
+#       Note: This file is generated within this pipeline (Part 2).
+#             If providing your own peak file, ensure it follows this format.
+#             Chromosome names must match those in annotation.gtf.
+#
+#   - GSF4363-435-CLIP-Rep-[1-3].unique.bam: WT CLIP BAM files
+#   - GSF4363-828-CLIP-Rep-[1-3].unique.bam: M182A CLIP BAM files
+#   - GSF4363-435-IN-Rep-[1-3].unique.bam: WT INPUT BAM files
+#   - GSF4363-828-IN-Rep-[1-3].unique.bam: M182A INPUT BAM files
+#       Note: BAM files must be sorted and indexed (.bai files required).
+#             Uniquely mapped reads only (multi-mappers excluded).
+#
+# Output files:
+#   - genes.bed: Gene-level annotation BED file (generated in Part 0)
+#   - gene_input_counts_for_Flipper.txt: Gene-level INPUT counts (Part 1)
+#   - peaks_with_IDs_stranded.bed: Peak file with GeneIDs and strand (Part 2)
+#   - background_regions.bed: Non-peak expressed regions (Part 3)
+#   - background_CLIP_counts.txt: CLIP counts in background regions (Part 4)
+#   - M182A_vs_WT_Flipper_HierarchicalNorm_Results.csv: Final results (Part 5)
+################################################################################
+
+
+################################################################################
+# PART 0: GENERATE GENE ANNOTATION BED FILE (BASH)
+# Convert GTF annotation to gene-level BED file for INPUT counting
+# Output: genes.bed (6 columns: chr, start, end, GeneID, score, strand)
+# Note: GTF is 1-based; BED is 0-based, so start coordinate is adjusted (start-1)
+################################################################################
+
+cd /N/slate/by6/GSF3524new/genome
+
+awk 'BEGIN{OFS="\t"} $3 == "gene" {
+  id="UNKNOWN";
+  for(i=9; i<=NF; i++) {
+    if($i ~ /gene_id/) { id=$(i+1); gsub(/"|;/, "", id); break }
+  }
+  print $1, $4-1, $5, id, ".", $7
+}' annotation.gtf > genes.bed
+
+# Verify
+wc -l genes.bed
+head -3 genes.bed
+
+# Copy to working directory
+scp genes.bed /N/slate/by6/M182A
+
+
+################################################################################
+# PART 1: GENERATE GENE-LEVEL INPUT COUNTS (BASH)
+# Count INPUT reads across entire gene bodies for each sample
+# Using gene-level rather than peak-level INPUT counts improves statistical
+# power by avoiding sparse counts in narrow peak windows
+# genes.bed has 6 cols → multicov appends 6 count cols → total 12 cols
+# Counts land in columns 7–12
+################################################################################
+
+cd /N/slate/by6/M182A
+
+# Index INPUT BAMs
+for bam in GSF4363-435-IN-Rep-*.unique.bam GSF4363-828-IN-Rep-*.unique.bam; do
+    echo "Indexing $bam..."
+    samtools index $bam
+done
+
+bedtools multicov -s \
+  -bams \
+    GSF4363-435-IN-Rep-1.unique.bam \
+    GSF4363-435-IN-Rep-2.unique.bam \
+    GSF4363-435-IN-Rep-3.unique.bam \
+    GSF4363-828-IN-Rep-1.unique.bam \
+    GSF4363-828-IN-Rep-2.unique.bam \
+    GSF4363-828-IN-Rep-3.unique.bam \
+  -bed genes.bed \
+  > gene_input_counts_for_Flipper.txt
+
+# Verify nonzero counts
+awk '{sum=0; for(i=7;i<=12;i++) sum+=$i; print sum}' gene_input_counts_for_Flipper.txt | head
+
+
+################################################################################
+# PART 2: GENERATE PEAK-LEVEL CLIP COUNTS (BASH)
+# Map WT bound peaks to parent genes with bound gene priority,
+# then count CLIP reads across all samples
+################################################################################
+
+# Index CLIP BAMs
+for bam in GSF4363-435-CLIP-Rep-*.unique.bam GSF4363-828-CLIP-Rep-*.unique.bam; do
+    echo "Indexing $bam..."
+    samtools index $bam
+done
+
+# Map peaks to Gene IDs, prioritising bound genes from WT_bound_genes.txt
+# For peaks overlapping multiple genes, a bound gene is always preferred
+# Falls back to whichever gene is available if no bound gene overlaps
+bedtools intersect \
+  -a GSF4363_435_chr.txt \
+  -b genes.bed \
+  -wa -wb \
+  | awk 'BEGIN{
+      OFS="\t";
+      while ((getline line < "GSF4363_435_bound_genes.txt") > 0) {
+          bound[line] = 1
+      }
+  }
+  {
+      key = $1"_"$2"_"$3;
+      gene = $7;
+      if (!(key in out) || (gene in bound && !(winner[key] in bound))) {
+          out[key] = $1"\t"$2"\t"$3"\t"gene"\t.\t"$9;
+          winner[key] = gene
+      }
+  }
+  END { for (k in out) print out[k] }' \
+  > peaks_with_IDs_stranded.bed
+
+# Verify peak count and strand
+wc -l peaks_with_IDs_stranded.bed
+cut -f6 peaks_with_IDs_stranded.bed | sort | uniq -c
+
+# Check bound gene assignment
+awk 'BEGIN{ while ((getline line < "GSF4363_435_bound_genes.txt") > 0) bound[line]=1 }
+     { if ($4 in bound) hit++; else miss++ }
+     END { print "Peaks assigned to bound gene:", hit;
+           print "Peaks fell back to other gene:", miss }' \
+  peaks_with_IDs_stranded.bed
+
+# Generate peak-level CLIP counts
+# peaks_with_IDs_stranded.bed has 6 cols → multicov appends 6 count cols → total 12
+# Counts land in columns 7–12
+bedtools multicov -s \
+  -bams \
+    GSF4363-435-CLIP-Rep-1.unique.bam \
+    GSF4363-435-CLIP-Rep-2.unique.bam \
+    GSF4363-435-CLIP-Rep-3.unique.bam \
+    GSF4363-828-CLIP-Rep-1.unique.bam \
+    GSF4363-828-CLIP-Rep-2.unique.bam \
+    GSF4363-828-CLIP-Rep-3.unique.bam \
+  -bed peaks_with_IDs_stranded.bed \
+  > 435_828_counts_with_IDs.txt
+
+# Verify nonzero counts
+awk '{sum=0; for(i=7;i<=12;i++) sum+=$i; print sum}' 435_828_counts_with_IDs.txt | head
+
+
+################################################################################
+# PART 3: GENERATE BACKGROUND REGIONS (BASH)
+# Background = expressed gene body regions not overlapping bound peaks
+# Used for Step 2 of hierarchical normalization
+################################################################################
+
+bedtools subtract \
+  -a genes.bed \
+  -b peaks_with_IDs_stranded.bed \
+  > background_regions.bed
+
+# Verify
+wc -l background_regions.bed
+
+
+################################################################################
+# PART 4: GENERATE BACKGROUND CLIP COUNTS (BASH)
+# Count CLIP reads in background regions for Step 2 normalization
+# background_regions.bed has 6 cols → multicov appends 6 count cols → total 12
+# Counts land in columns 7–12
+################################################################################
+
+bedtools multicov -s \
+  -bams \
+    GSF4363-435-CLIP-Rep-1.unique.bam \
+    GSF4363-435-CLIP-Rep-2.unique.bam \
+    GSF4363-435-CLIP-Rep-3.unique.bam \
+    GSF4363-828-CLIP-Rep-1.unique.bam \
+    GSF4363-828-CLIP-Rep-2.unique.bam \
+    GSF4363-828-CLIP-Rep-3.unique.bam \
+  -bed background_regions.bed \
+  > background_CLIP_counts.txt
+
+# Verify nonzero counts
+awk '{sum=0; for(i=7;i<=12;i++) sum+=$i; print sum}' background_CLIP_counts.txt | head
+wc -l background_CLIP_counts.txt
+
+
+################################################################################
+# PART 5: FLIPPER INTERACTION ANALYSIS WITH HIERARCHICAL NORMALIZATION (R)
+################################################################################
+
+library("tidyverse")
+library("DESeq2")
+
+setwd("/N/slate/by6/M182A/")
+
+
+# ── 1. Load peak-level CLIP data ──────────────────────────────────────────────
+# 435_828_counts_with_IDs.txt has 12 columns:
+# chr, start, end, GeneID, score, strand,
+# WT.R1, WT.R2, WT.R3, M182A.R1, M182A.R2, M182A.R3
+peak_ip <- read.table("435_828_counts_with_IDs.txt", header = FALSE)
+
+rownames(peak_ip) <- make.unique(paste(peak_ip$V1, peak_ip$V2, peak_ip$V3, sep = "_"))
+
+peak_to_gene_map <- peak_ip$V4        # GeneID = column 4
+peak_ip_counts   <- peak_ip[, 7:12]  # CLIP counts = columns 7–12
+colnames(peak_ip_counts) <- c("WT.IP.R1",    "WT.IP.R2",    "WT.IP.R3",
+                               "M182A.IP.R1", "M182A.IP.R2", "M182A.IP.R3")
+
+
+# ── 2. Load gene-level INPUT data ─────────────────────────────────────────────
+# gene_input_counts_for_Flipper.txt has 12 columns:
+# chr, start, end, GeneID, score, strand,
+# WT.R1, WT.R2, WT.R3, M182A.R1, M182A.R2, M182A.R3
+gene_in <- read.table("gene_input_counts_for_Flipper.txt", header = FALSE)
+
+rownames(gene_in) <- gene_in$V4       # GeneID as row name
+gene_in_counts   <- gene_in[, 7:12]  # INPUT counts = columns 7–12
+colnames(gene_in_counts) <- c("WT.INg.R1",    "WT.INg.R2",    "WT.INg.R3",
+                               "M182A.INg.R1", "M182A.INg.R2", "M182A.INg.R3")
+
+
+# ── 3. Build the Flipper interaction matrix ───────────────────────────────────
+# Each peak row gets: [its 6 CLIP counts | its parent gene's 6 INPUT counts]
+# Final matrix: nPeaks × 12 columns
+combined_counts <- matrix(0, nrow = nrow(peak_ip_counts), ncol = 12)
+
+for (i in 1:nrow(peak_ip_counts)) {
+  parent_gene <- peak_to_gene_map[i]
+  combined_counts[i, ] <- c(
+    as.numeric(peak_ip_counts[i, ]),
+    as.numeric(gene_in_counts[parent_gene, ])
+  )
+}
+
+rownames(combined_counts) <- rownames(peak_ip_counts)
+colnames(combined_counts) <- c(colnames(peak_ip_counts), colnames(gene_in_counts))
+
+# Sanity check
+cat("Total peaks in matrix:  ", nrow(combined_counts), "\n")
+cat("Total CLIP counts:      ", sum(combined_counts[, 1:6]), "\n")
+cat("Total INPUT counts:     ", sum(combined_counts[, 7:12]), "\n")
+
+
+# ── 4. Filter low-count peaks ─────────────────────────────────────────────────
+keep <- rowSums(combined_counts[, 1:6]) >= 1
+combined_counts <- combined_counts[keep, ]
+cat("Peaks retained after filtering:", nrow(combined_counts), "\n")
+
+
+# ── 5. Define the Flipper interaction design ──────────────────────────────────
+# 12 columns ordered: WT.IP×3, M182A.IP×3, WT.INg×3, M182A.INg×3
+# Model tests whether the IP/INg ratio changes between WT and M182A
+assay     <- factor(c(rep("IP",    6), rep("INg",   6)))
+treatment <- factor(c(rep("WT",    3), rep("M182A", 3),
+                      rep("WT",    3), rep("M182A", 3)))
+
+coldata <- data.frame(row.names = colnames(combined_counts), assay, treatment)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = combined_counts,
+  colData   = coldata,
+  design    = ~ assay + treatment + assay:treatment
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HIERARCHICAL NORMALIZATION (approximated from Flipper, Flanagan et al. 2026)
+#
+# CLIP size factors are estimated in two steps:
+#   Step 1: Within-treatment MOR from binding regions
+#           → corrects for pulldown efficiency differences between replicates
+#   Step 2: Cross-treatment MOR from background regions
+#           → corrects for sequencing depth differences between conditions
+#
+# INPUT size factors are estimated from uniquely mapped read counts,
+# as INPUT samples are not subject to pulldown efficiency variation.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Step 1: Within-treatment MOR from binding regions ─────────────────────────
+
+# MOR within WT group
+counts_WT      <- as.matrix(peak_ip_counts[, 1:3])
+counts_WT_filt <- counts_WT[rowSums(counts_WT) > 0 &
+                              apply(counts_WT, 1, min) > 0, ]
+
+geo_mean_WT <- exp(rowMeans(log(counts_WT_filt)))
+ratios_WT   <- sweep(counts_WT_filt, 1, geo_mean_WT, "/")
+sf_WT       <- apply(ratios_WT, 2, median)
+cat("Step 1 size factors — WT CLIP:\n")
+print(sf_WT)
+
+# MOR within M182A group
+counts_M182A      <- as.matrix(peak_ip_counts[, 4:6])
+counts_M182A_filt <- counts_M182A[rowSums(counts_M182A) > 0 &
+                                   apply(counts_M182A, 1, min) > 0, ]
+
+geo_mean_M182A <- exp(rowMeans(log(counts_M182A_filt)))
+ratios_M182A   <- sweep(counts_M182A_filt, 1, geo_mean_M182A, "/")
+sf_M182A       <- apply(ratios_M182A, 2, median)
+cat("Step 1 size factors — M182A CLIP:\n")
+print(sf_M182A)
+
+
+# ── Step 2: Cross-treatment MOR from background regions ───────────────────────
+
+# Load background CLIP counts (47,298 non-peak expressed regions)
+bg        <- read.table("background_CLIP_counts.txt", header = FALSE)
+bg_counts <- as.matrix(bg[, 7:12])
+colnames(bg_counts) <- c("WT.IP.R1",    "WT.IP.R2",    "WT.IP.R3",
+                          "M182A.IP.R1", "M182A.IP.R2", "M182A.IP.R3")
+
+# Filter rows with zeros for stable MOR estimation
+bg_filt <- bg_counts[rowSums(bg_counts) > 0 &
+                      apply(bg_counts, 1, min) > 0, ]
+cat("Background regions used for Step 2 MOR:", nrow(bg_filt), "\n")
+
+# MOR across all 6 CLIP samples
+geo_mean_bg <- exp(rowMeans(log(bg_filt)))
+ratios_bg   <- sweep(bg_filt, 1, geo_mean_bg, "/")
+sf_bg_all   <- apply(ratios_bg, 2, median)
+cat("Step 2 size factors — all CLIP samples:\n")
+print(sf_bg_all)
+
+# Average within each treatment group
+sf_bg_WT_mean    <- mean(sf_bg_all[1:3])
+sf_bg_M182A_mean <- mean(sf_bg_all[4:6])
+cat("Step 2 averaged within WT:   ", sf_bg_WT_mean, "\n")
+cat("Step 2 averaged within M182A:", sf_bg_M182A_mean, "\n")
+
+
+# ── Combine Step 1 and Step 2 into final CLIP size factors ────────────────────
+# Each sample's final SF = binding SF (Step 1) × background SF (Step 2)
+sf_bg_per_sample <- c(rep(sf_bg_WT_mean,    3),   # WT R1, R2, R3
+                      rep(sf_bg_M182A_mean, 3))   # M182A R1, R2, R3
+
+sf_binding  <- c(sf_WT, sf_M182A)
+sf_final_IP <- sf_binding * sf_bg_per_sample
+sf_final_IP <- sf_final_IP / mean(sf_final_IP)    # Normalize to mean of 1
+
+cat("\nFinal combined CLIP size factors:\n")
+print(sf_final_IP)
+
+
+# ── INPUT size factors from uniquely mapped reads ─────────────────────────────
+# INPUT samples are not subject to pulldown efficiency variation,
+# so uniquely mapped read counts are used for depth normalization only.
+# Order: WT.INg.R1, WT.INg.R2, WT.INg.R3, M182A.INg.R1, M182A.INg.R2, M182A.INg.R3
+uniquely_mapped_INPUT <- c(
+  5259756, 7124597, 6040131,   # WT INPUT R1, R2, R3
+  5342242, 5169929, 5063241    # M182A INPUT R1, R2, R3
+)
+sf_INPUT <- uniquely_mapped_INPUT / mean(uniquely_mapped_INPUT)
+
+
+# ── Apply final size factors to DESeq2 object ─────────────────────────────────
+# Order must match combined_counts columns exactly:
+# WT.IP.R1-3, M182A.IP.R1-3, WT.INg.R1-3, M182A.INg.R1-3
+sf_all_12 <- c(sf_final_IP, sf_INPUT)
+sf_all_12 <- sf_all_12 / mean(sf_all_12)   # Normalize to mean of 1
+
+sizeFactors(dds) <- sf_all_12
+cat("\nFinal size factors applied to DESeq2 object:\n")
+print(sizeFactors(dds))
+
+
+# ── 6. Relevel and run DESeq2 ─────────────────────────────────────────────────
+# Manual dispersion estimation for robustness with small replicate numbers
+# in a 2×2 interaction design
+dds$assay     <- relevel(dds$assay,     ref = "INg")
+dds$treatment <- relevel(dds$treatment, ref = "WT")
+
+dds <- estimateDispersionsGeneEst(dds)
+dispersions(dds) <- mcols(dds)$dispGeneEst
+dds <- nbinomWaldTest(dds)
+
+
+# ── 7. Extract the interaction term ───────────────────────────────────────────
+# assayIP.treatmentM182A = change in IP/INg ratio in M182A relative to WT
+# Positive LFC → increased binding in M182A relative to WT
+# Negative LFC → decreased binding in M182A relative to WT
+res <- results(dds,
+               name        = "assayIP.treatmentM182A",
+               alpha       = 0.05,
+               cooksCutoff = FALSE)
+
+
+# ── 8. Extract normalized counts and merge with results ───────────────────────
+# Normalized counts for all 12 columns:
+# WT.IP.R1-3, M182A.IP.R1-3, WT.INg.R1-3, M182A.INg.R1-3
+normalized_counts <- counts(dds, normalized = TRUE)
+
+merged <- merge(as.data.frame(res),
+                as.data.frame(normalized_counts),
+                by = "row.names")
+names(merged)[1] <- "peak"
+
+
+# ── 9. Summary and export ─────────────────────────────────────────────────────
+cat("\n--- Differential Binding Results: M182A vs WT ---\n")
+cat("Total peaks tested:               ", nrow(res), "\n")
+cat("Peaks with p < 0.05:              ", sum(res$pvalue < 0.05, na.rm = TRUE), "\n")
+cat("Significant binding (padj < 0.05):", sum(res$padj   < 0.05, na.rm = TRUE), "\n")
+
+write.csv(merged,
+          file      = "M182A_vs_WT_Flipper_HierarchicalNorm_Results.csv",
+          row.names = FALSE)
